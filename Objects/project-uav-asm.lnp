@@ -1,0 +1,4 @@
+".\Objects\STARTUP.obj",
+".\Objects\project-uav-asm.obj" 
+TO ".\Objects\project-uav-asm" 
+PRINT(".\Listings\project-uav-asm.m51") RAMSIZE(256) 

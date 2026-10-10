@@ -1,0 +1,567 @@
+C51 COMPILER V9.60.7.0   PROJECT_UAV_ASM                                                   08/01/2026 17:09:59 PAGE 1   
+
+
+C51 COMPILER V9.60.7.0, COMPILATION OF MODULE PROJECT_UAV_ASM
+OBJECT MODULE PLACED IN .\Objects\project-uav-asm.obj
+COMPILER INVOKED BY: C:\Keil_v5\C51\BIN\C51.EXE project-uav-asm.c OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND PRINT(.\Li
+                    -stings\project-uav-asm.lst) TABS(2) OBJECT(.\Objects\project-uav-asm.obj)
+
+line level    source
+
+   1          #include <reg52.h>
+   2          #include <intrins.h>
+   3          
+   4          #define TOC_DO_NHAY_MET 7
+   5          
+   6          // =========================================================
+   7          // 1. PHAN CUNG & I2C
+   8          // =========================================================
+   9          #define ADC_PORT P0
+  10          
+  11          sbit RD_ADC      = P2^2;
+  12          sbit WR_ADC      = P2^3;
+  13          sbit INTR        = P3^6;
+  14          
+  15          sbit I2C_SCL     = P2^0;
+  16          sbit I2C_SDA     = P2^1;
+  17          sbit LDR_PIN     = P1^0;
+  18          
+  19          #define PCF8574_LCD_ADDR 0x40
+  20          #define PCF8574_U7_ADDR  0x42
+  21          #define PCF8574_U6_ADDR  0x44
+  22          
+  23          #define MASK_LED_RED    0x01
+  24          #define MASK_LED_YELLOW 0x02
+  25          #define MASK_LED_BLUE   0x04
+  26          #define MASK_LED_GREEN  0x08
+  27          #define MASK_LED_PURPLE 0x10
+  28          #define MASK_LED_PINK   0x20
+  29          #define MASK_LED_NIGHT  0x40
+  30          #define MASK_LED_FLASH  0x80
+  31          
+  32          sbit TR          = P1^5;
+  33          sbit ECHO        = P1^6;
+  34          
+  35          sbit GAS_PIN     = P1^2;
+  36          sbit PIR_SENSOR  = P1^3;
+  37          sbit BTN_TROM    = P1^4;
+  38          sbit BUZZER      = P1^7;
+  39          
+  40          sbit CAM_SENSOR  = P2^6;
+  41          sbit RAIN_SENSOR = P2^7;
+  42          
+  43          sbit MOT_IN1     = P3^4;
+  44          sbit MOT_IN2     = P3^5;
+  45          
+  46          // =========================================================
+  47          // 2. BIEN TOAN CUC
+  48          // =========================================================
+  49          typedef enum {
+  50              NORMAL, MOTION, INTRUDER, OBSTACLE,
+  51              GAS_LEAK, RAIN_WARNING, SMALL_FIRE, BIG_FIRE
+  52          } SystemState;
+  53          
+  54          SystemState currentState = NORMAL;
+C51 COMPILER V9.60.7.0   PROJECT_UAV_ASM                                                   08/01/2026 17:09:59 PAGE 2   
+
+  55          SystemState lastState = NORMAL; // Theo doi de chi gui UART 1 lan khi doi trang thai
+  56          
+  57          unsigned char timer_ticks = 0;
+  58          unsigned char current_temp = 0;
+  59          unsigned int  distance_cm = 0;
+  60          unsigned char distance_m = 0;
+  61          unsigned char tick_counter_1m = 0;
+  62          
+  63          bit blink_flag = 0;
+  64          bit fast_blink_flag = 0;
+  65          unsigned char led_u7_state = 0x00;
+  66          
+  67          bit intruder_active = 0;
+  68          bit last_btn_trom = 1;
+  69          bit motion_active = 0;
+  70          bit rain_active = 0;
+  71          
+  72          bit cam_active = 0;
+  73          bit last_cam_state = 1;
+  74          bit cam_triggered_flag = 0;
+  75          
+  76          unsigned char gps_timer_ticks = 0;
+  77          bit gps_10s_flag = 0;
+  78          bit is_daytime = 1;
+  79          bit last_daytime = 1;
+  80          
+  81          unsigned char code seg7_CA[10] = {
+  82              0xC0, 0xF9, 0xA4, 0xB0, 0x99, 
+  83              0x92, 0x82, 0xF8, 0x80, 0x90
+  84          };
+  85          
+  86          // =========================================================
+  87          // 3. DELAY & UART
+  88          // =========================================================
+  89          void Delay_ms(unsigned char ms) {
+  90   1          unsigned char i, j;
+  91   1          for(i = 0; i < ms; i++)
+  92   1              for(j = 0; j < 112; j++);
+  93   1      }
+  94          
+  95          void Delay_Trigger(void) {
+  96   1          _nop_(); _nop_(); _nop_(); _nop_();
+  97   1          _nop_(); _nop_(); _nop_(); _nop_();
+  98   1      }
+  99          
+ 100          void UART_Init(void) {
+ 101   1          SCON  = 0x50;
+ 102   1          T2CON = 0x34;
+ 103   1          RCAP2H = 0xFF;
+ 104   1          RCAP2L = 0xDC; // 9600 bps voi 11.0592 MHz
+ 105   1          TH2    = 0xFF;
+ 106   1          TL2    = 0xDC;
+ 107   1      }
+ 108          
+ 109          void UART_TxChar(char c) {
+ 110   1          SBUF = c;
+ 111   1          while(!TI);
+ 112   1          TI = 0;
+ 113   1      }
+ 114          
+ 115          void UART_SendString(char code *str) {
+ 116   1          while(*str) UART_TxChar(*str++);
+C51 COMPILER V9.60.7.0   PROJECT_UAV_ASM                                                   08/01/2026 17:09:59 PAGE 3   
+
+ 117   1      }
+ 118          
+ 119          // In so ra UART cuc nhe
+ 120          void UART_PrintNum(unsigned int num) {
+ 121   1          unsigned char d = 0;
+ 122   1          while(num >= 100) { num -= 100; d++; }
+ 123   1          if(d) UART_TxChar(d + '0');
+ 124   1          d = 0;
+ 125   1          while(num >= 10)  { num -= 10; d++; }
+ 126   1          UART_TxChar(d + '0');
+ 127   1          UART_TxChar(num + '0');
+ 128   1      }
+ 129          
+ 130          // =========================================================
+ 131          // 4. I2C MODULE
+ 132          // =========================================================
+ 133          void I2C_Start(void) {
+ 134   1          I2C_SDA = 1; I2C_SCL = 1;
+ 135   1          I2C_SDA = 0;
+ 136   1          I2C_SCL = 0;
+ 137   1      }
+ 138          
+ 139          void I2C_Stop(void) {
+ 140   1          I2C_SDA = 0; I2C_SCL = 1;
+ 141   1          I2C_SDA = 1;
+ 142   1      }
+ 143          
+ 144          void I2C_Write(unsigned char dat) {
+ 145   1          unsigned char i;
+ 146   1          for(i = 0; i < 8; i++) {
+ 147   2              I2C_SDA = (dat & 0x80) ? 1 : 0;
+ 148   2              I2C_SCL = 1;
+ 149   2              I2C_SCL = 0;
+ 150   2              dat <<= 1;
+ 151   2          }
+ 152   1          I2C_SDA = 1; I2C_SCL = 1;
+ 153   1          I2C_SCL = 0;
+ 154   1      }
+ 155          
+ 156          // =========================================================
+ 157          // 5. LCD MODULE
+ 158          // =========================================================
+ 159          void LCD_Send_I2C(unsigned char dat) {
+ 160   1          I2C_Start();
+ 161   1          I2C_Write(PCF8574_LCD_ADDR);
+ 162   1          I2C_Write(dat);
+ 163   1          I2C_Stop();
+ 164   1      }
+ 165          
+ 166          void LCD_Write_Nibble(unsigned char nibble, unsigned char rs) {
+ 167   1          unsigned char d = (nibble & 0xF0) | rs;
+ 168   1          LCD_Send_I2C(d | 0x04);
+ 169   1          LCD_Send_I2C(d & ~0x04);
+ 170   1      }
+ 171          
+ 172          void LCD_Cmd(unsigned char cmd) {
+ 173   1          LCD_Write_Nibble(cmd, 0);
+ 174   1          LCD_Write_Nibble(cmd << 4, 0);
+ 175   1          Delay_ms(1);
+ 176   1      }
+ 177          
+ 178          void LCD_Data(unsigned char dat) {
+C51 COMPILER V9.60.7.0   PROJECT_UAV_ASM                                                   08/01/2026 17:09:59 PAGE 4   
+
+ 179   1          LCD_Write_Nibble(dat, 1);
+ 180   1          LCD_Write_Nibble(dat << 4, 1);
+ 181   1      }
+ 182          
+ 183          void LCD_Init(void) {
+ 184   1          Delay_ms(20);
+ 185   1          LCD_Write_Nibble(0x30, 0); Delay_ms(5);
+ 186   1          LCD_Write_Nibble(0x30, 0); Delay_ms(1);
+ 187   1          LCD_Write_Nibble(0x30, 0);
+ 188   1          LCD_Write_Nibble(0x20, 0);
+ 189   1          LCD_Cmd(0x28);
+ 190   1          LCD_Cmd(0x0C);
+ 191   1          LCD_Cmd(0x01);
+ 192   1      }
+ 193          
+ 194          void LCD_PrintStr(char code *str) {
+ 195   1          while(*str) LCD_Data(*str++);
+ 196   1      }
+ 197          
+ 198          void LCD_Print(char code *s1, char code *s2) {
+ 199   1          LCD_Cmd(0x80); LCD_PrintStr(s1);
+ 200   1          LCD_Cmd(0xC0); LCD_PrintStr(s2);
+ 201   1      }
+ 202          
+ 203          void LCD_PrintNum(unsigned int num) {
+ 204   1          unsigned char d = 0;
+ 205   1          while(num >= 100) { num -= 100; d++; }
+ 206   1          if(d) LCD_Data(d + '0');
+ 207   1          d = 0;
+ 208   1          while(num >= 10)  { num -= 10; d++; }
+ 209   1          LCD_Data(d + '0');
+ 210   1          LCD_Data(num + '0');
+ 211   1      }
+ 212          
+ 213          // =========================================================
+ 214          // 6. MODULE LED
+ 215          // =========================================================
+ 216          void Update_7Seg(unsigned char number) {
+ 217   1          I2C_Start();
+ 218   1          I2C_Write(PCF8574_U6_ADDR);
+ 219   1          I2C_Write(seg7_CA[number % 10]);
+ 220   1          I2C_Stop();
+ 221   1      }
+ 222          
+ 223          void Update_U7(void) {
+ 224   1          I2C_Start();
+ 225   1          I2C_Write(PCF8574_U7_ADDR);
+ 226   1          I2C_Write(led_u7_state);
+ 227   1          I2C_Stop();
+ 228   1      }
+ 229          
+ 230          // =========================================================
+ 231          // 7. DOC CAM BIEN
+ 232          // =========================================================
+ 233          unsigned char Read_ADC(void) {
+ 234   1          unsigned char adc_val;
+ 235   1          unsigned int timeout = 0;
+ 236   1      
+ 237   1          ADC_PORT = 0xFF;
+ 238   1          WR_ADC = 0; _nop_(); WR_ADC = 1;
+ 239   1      
+ 240   1          while(INTR == 1) {
+C51 COMPILER V9.60.7.0   PROJECT_UAV_ASM                                                   08/01/2026 17:09:59 PAGE 5   
+
+ 241   2              if(++timeout > 300) return current_temp;
+ 242   2          }
+ 243   1      
+ 244   1          RD_ADC = 0; _nop_();
+ 245   1          adc_val = ADC_PORT;
+ 246   1          RD_ADC = 1;
+ 247   1          return adc_val;
+ 248   1      }
+ 249          
+ 250          unsigned int Read_Sonar(void) {
+ 251   1          unsigned int time;
+ 252   1          unsigned int timeout = 0;
+ 253   1      
+ 254   1          TR = 1;
+ 255   1          Delay_Trigger();
+ 256   1          TR = 0;
+ 257   1      
+ 258   1          while(!ECHO) {
+ 259   2              if(++timeout > 500) return 999;
+ 260   2          }
+ 261   1      
+ 262   1          TH0 = 0; TL0 = 0; TF0 = 0;
+ 263   1          TR0 = 1;
+ 264   1          while(ECHO && !TF0);
+ 265   1          TR0 = 0;
+ 266   1      
+ 267   1          if(TF0) { TF0 = 0; return 999; }
+ 268   1          time = (TH0 << 8) | TL0;
+ 269   1          return (time >> 6); 
+ 270   1      }
+ 271          
+ 272          // =========================================================
+ 273          // 8. TIMER 1 (50ms)
+ 274          // =========================================================
+ 275          void Timer1_ISR(void) interrupt 3 {
+ 276   1          TH1 = 0x3C;
+ 277   1          TL1 = 0xB0;
+ 278   1          timer_ticks++;
+ 279   1      
+ 280   1          if((timer_ticks & 1) == 0)
+ 281   1              fast_blink_flag = ~fast_blink_flag;
+ 282   1      
+ 283   1          if(timer_ticks >= 20) {
+ 284   2              timer_ticks = 0;
+ 285   2              blink_flag = ~blink_flag;
+ 286   2          }
+ 287   1      
+ 288   1          if(++gps_timer_ticks >= 200) {
+ 289   2              gps_timer_ticks = 0;
+ 290   2              gps_10s_flag = 1;
+ 291   2          }
+ 292   1      
+ 293   1          if(currentState != OBSTACLE && currentState != MOTION) {
+ 294   2              if(++tick_counter_1m >= TOC_DO_NHAY_MET) {
+ 295   3                  tick_counter_1m = 0;
+ 296   3                  if(++distance_m > 9) distance_m = 0;
+ 297   3              }
+ 298   2          }
+ 299   1      }
+ 300          
+ 301          // =========================================================
+ 302          // 9. LOGIC CAM BIEN
+C51 COMPILER V9.60.7.0   PROJECT_UAV_ASM                                                   08/01/2026 17:09:59 PAGE 6   
+
+ 303          // =========================================================
+ 304          void Read_Sensors(void) {
+ 305   1          current_temp = (unsigned char)(((unsigned int)Read_ADC() * 12) / 5);
+ 306   1          distance_cm  = Read_Sonar();
+ 307   1      
+ 308   1          if(BTN_TROM == 0) {
+ 309   2              if(last_btn_trom == 1) {
+ 310   3                  intruder_active = ~intruder_active;
+ 311   3                  last_btn_trom = 0;
+ 312   3              }
+ 313   2          } else {
+ 314   2              last_btn_trom = 1;
+ 315   2          }
+ 316   1      
+ 317   1          motion_active = (PIR_SENSOR == 0);
+ 318   1          rain_active   = (RAIN_SENSOR == 0);
+ 319   1      
+ 320   1          if(CAM_SENSOR == 0) {
+ 321   2              cam_active = 1;
+ 322   2              if(last_cam_state == 1) {
+ 323   3                  cam_triggered_flag = 1;
+ 324   3                  last_cam_state = 0;
+ 325   3              }
+ 326   2          } else {
+ 327   2              cam_active = 0;
+ 328   2              last_cam_state = 1;
+ 329   2          }
+ 330   1      
+ 331   1          is_daytime = (LDR_PIN == 0);
+ 332   1      }
+ 333          
+ 334          void Determine_State(void) {
+ 335   1          if(current_temp >= 80)           currentState = BIG_FIRE;
+ 336   1          else if(current_temp >= 50)      currentState = SMALL_FIRE;
+ 337   1          else if(GAS_PIN == 0)            currentState = GAS_LEAK;
+ 338   1          else if(rain_active)             currentState = RAIN_WARNING;
+ 339   1          else if(distance_cm < 20)        currentState = OBSTACLE;
+ 340   1          else if(intruder_active)         currentState = INTRUDER;
+ 341   1          else if(motion_active)           currentState = MOTION;
+ 342   1          else                             currentState = NORMAL;
+ 343   1      }
+ 344          
+ 345          // =========================================================
+ 346          // 10. THUC THI HANH DONG & GUI UART KHI DOI TRANG THAI
+ 347          // =========================================================
+ 348          void Execute_Action(void) {
+ 349   1          led_u7_state = MASK_LED_BLUE;
+ 350   1      
+ 351   1          // Chi gui Serial 1 lan khi he thong chuyen sang trang thai moi
+ 352   1          if(currentState != lastState) {
+ 353   2              switch(currentState) {
+ 354   3                  case BIG_FIRE:
+ 355   3                      UART_SendString("Chay lon roi cuu hoa di!\r\n");
+ 356   3                      break;
+ 357   3                  case SMALL_FIRE:
+ 358   3                      UART_SendString("Chay nho roi!\r\n");
+ 359   3                      break;
+ 360   3                  case GAS_LEAK:
+ 361   3                      UART_SendString("Co gas kia!\r\n");
+ 362   3                      break;
+ 363   3                  case RAIN_WARNING:
+ 364   3                      UART_SendString("Troi mua roi!\r\n");
+C51 COMPILER V9.60.7.0   PROJECT_UAV_ASM                                                   08/01/2026 17:09:59 PAGE 7   
+
+ 365   3                      break;
+ 366   3                  case MOTION:
+ 367   3                      UART_SendString("Co xe!\r\n");
+ 368   3                      break;
+ 369   3                  case INTRUDER:
+ 370   3                      UART_SendString("Bo Nguoi Ta An trom!\r\n");
+ 371   3                      break;
+ 372   3                  case OBSTACLE:
+ 373   3                      UART_SendString("Giu Khoang cach");
+ 374   3                      UART_PrintNum(distance_cm);
+ 375   3                      UART_SendString(" cm\r\n");
+ 376   3                      break;
+ 377   3                  default:
+ 378   3                      break;
+ 379   3              }
+ 380   2              lastState = currentState;
+ 381   2          }
+ 382   1          
+ 383   1          if(is_daytime != last_daytime) {
+ 384   2              if(is_daytime) {
+ 385   3                  UART_SendString("NGAY\r\n");
+ 386   3              } else {
+ 387   3                  UART_SendString("DEM\r\n");
+ 388   3              }
+ 389   2              last_daytime = is_daytime;
+ 390   2          }
+ 391   1      
+ 392   1          // Dieu khien LCD va Coi / LED
+ 393   1          switch(currentState) {
+ 394   2              case BIG_FIRE:
+ 395   2                  if(fast_blink_flag) led_u7_state |= MASK_LED_RED;
+ 396   2                  BUZZER = fast_blink_flag;
+ 397   2                  LCD_Print("BIG FIRE", "DANGER!");
+ 398   2                  MOT_IN1 = 0; MOT_IN2 = 0;
+ 399   2                  break;
+ 400   2      
+ 401   2              case SMALL_FIRE:
+ 402   2                  if(fast_blink_flag) led_u7_state |= MASK_LED_RED;
+ 403   2                  BUZZER = blink_flag;
+ 404   2                  LCD_Cmd(0x80); LCD_PrintStr("SMALL FIRE");
+ 405   2                  LCD_Cmd(0xC0); LCD_PrintStr("Temp: ");
+ 406   2                  LCD_PrintNum(current_temp);
+ 407   2                  LCD_PrintStr(" C   ");
+ 408   2                  MOT_IN1 = 0; MOT_IN2 = 0;
+ 409   2                  break;
+ 410   2      
+ 411   2              case GAS_LEAK:
+ 412   2                  led_u7_state |= MASK_LED_YELLOW;
+ 413   2                  BUZZER = 1;
+ 414   2                  LCD_Print("GAS WARNING", "LEAK DETECTED");
+ 415   2                  break;
+ 416   2      
+ 417   2              case RAIN_WARNING:
+ 418   2                  BUZZER = 1;
+ 419   2                  LCD_Print("RAIN WARNING", "RAIN DETECTED");
+ 420   2                  MOT_IN1 = 0; MOT_IN2 = 0;
+ 421   2                  break;
+ 422   2      
+ 423   2              case OBSTACLE:
+ 424   2                  BUZZER = 0;
+ 425   2                  LCD_Cmd(0x80); LCD_PrintStr("OBSTACLE");
+ 426   2                  LCD_Cmd(0xC0); LCD_PrintStr("Dist: ");
+C51 COMPILER V9.60.7.0   PROJECT_UAV_ASM                                                   08/01/2026 17:09:59 PAGE 8   
+
+ 427   2                  LCD_PrintNum(distance_cm);
+ 428   2                  LCD_PrintStr(" cm  ");
+ 429   2                  MOT_IN1 = 0; MOT_IN2 = 0;
+ 430   2                  break;
+ 431   2      
+ 432   2              case INTRUDER:
+ 433   2                  led_u7_state |= MASK_LED_PURPLE;
+ 434   2                  BUZZER = 1;
+ 435   2                  LCD_Print("INTRUDER", "SECURITY ALERT");
+ 436   2                  MOT_IN1 = 0; MOT_IN2 = 0;
+ 437   2                  break;
+ 438   2      
+ 439   2              case MOTION:
+ 440   2                  led_u7_state |= MASK_LED_GREEN;
+ 441   2                  BUZZER = 0;
+ 442   2                  LCD_Print("MOTION/VEHICLE", "XE DUNG LAI");
+ 443   2                  MOT_IN1 = 0; MOT_IN2 = 0;
+ 444   2                  break;
+ 445   2      
+ 446   2              case NORMAL:
+ 447   2              default:
+ 448   2                  BUZZER = 0;
+ 449   2                  LCD_Cmd(0x80); LCD_PrintStr("UAV NORMAL");
+ 450   2                  LCD_Cmd(0xC0);
+ 451   2                  LCD_PrintStr(is_daytime ? "NGAY T:" : "DEM  T:");
+ 452   2                  LCD_PrintNum(current_temp);
+ 453   2                  LCD_PrintStr("C M:");
+ 454   2                  LCD_Data(distance_m + '0');
+ 455   2                  LCD_PrintStr(" ");
+ 456   2                  MOT_IN1 = 1; MOT_IN2 = 1;
+ 457   2                  break;
+ 458   2          }
+ 459   1      
+ 460   1          if(rain_active)      led_u7_state |= MASK_LED_PINK;
+ 461   1          if(is_daytime == 0)  led_u7_state |= MASK_LED_NIGHT;
+ 462   1          else                  led_u7_state &= ~MASK_LED_NIGHT;
+ 463   1          if(cam_active)       led_u7_state |= MASK_LED_FLASH;
+ 464   1      }
+ 465          
+ 466          // =========================================================
+ 467          // 11. KHOI TAO HE THONG
+ 468          // =========================================================
+ 469          void Init_System(void) {
+ 470   1          BUZZER = 0;
+ 471   1          MOT_IN1 = 1; MOT_IN2 = 1;
+ 472   1          RAIN_SENSOR = 1; PIR_SENSOR = 1; CAM_SENSOR = 1; LDR_PIN = 1;
+ 473   1      
+ 474   1          TMOD = 0x11;
+ 475   1          TH1  = 0x3C; TL1 = 0xB0;
+ 476   1          TR1  = 1; ET1 = 1; EA = 1;
+ 477   1      
+ 478   1          UART_Init();
+ 479   1          LCD_Init();
+ 480   1      
+ 481   1          led_u7_state = 0;
+ 482   1          Update_U7();
+ 483   1          Update_7Seg(0);
+ 484   1      
+ 485   1          LCD_Print("SYSTEM INIT...", "WAITING...");
+ 486   1      
+ 487   1          // Doc truoc trang thai ngay/dem ban dau
+ 488   1          is_daytime = (LDR_PIN == 0);
+C51 COMPILER V9.60.7.0   PROJECT_UAV_ASM                                                   08/01/2026 17:09:59 PAGE 9   
+
+ 489   1          last_daytime = is_daytime;
+ 490   1      
+ 491   1          // Thong bao khoi dong he thong kem ngay/dem va toa do GPS
+ 492   1          UART_SendString("SYSTEM ONLINE: GPS & CAM READY\r\n");
+ 493   1          if(is_daytime) {
+ 494   2            UART_SendString("BAN NGAY\r\n");
+ 495   2          } else {
+ 496   2            UART_SendString("BAN DEM\r\n");
+ 497   2          }
+ 498   1          Delay_ms(200);
+ 499   1      }
+ 500          
+ 501          // =========================================================
+ 502          // 12. MAIN LOOP
+ 503          // =========================================================
+ 504          void main(void) {
+ 505   1          Init_System();
+ 506   1      
+ 507   1          while(1) {
+ 508   2              Read_Sensors();
+ 509   2              Determine_State();
+ 510   2              Execute_Action();
+ 511   2      
+ 512   2              // Phat hien vat the qua Camera
+ 513   2              if(cam_triggered_flag) {
+ 514   3                  cam_triggered_flag = 0;
+ 515   3              }
+ 516   2      
+ 517   2              // Dinh ky 10s cap nhat toa do GPS
+ 518   2              if(gps_10s_flag) {
+ 519   3                  gps_10s_flag = 0;
+ 520   3              }
+ 521   2      
+ 522   2              Update_U7();
+ 523   2              Update_7Seg(distance_m);
+ 524   2      
+ 525   2              Delay_ms(10);
+ 526   2          }
+ 527   1      }
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   1465    ----
+   CONSTANT SIZE    =    431    ----
+   XDATA SIZE       =   ----    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =     10       4
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =     12    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

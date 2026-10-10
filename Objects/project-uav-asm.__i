@@ -1,0 +1,1 @@
+"project-uav-asm.c" OPTIMIZE (8,SPEED) BROWSE DEBUG OBJECTEXTEND PRINT(.\Listings\project-uav-asm.lst) TABS (2) OBJECT(.\Objects\project-uav-asm.obj)
